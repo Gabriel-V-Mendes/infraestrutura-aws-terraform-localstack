@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  localstack:
+    container_name: "aws-localstack"
+   
+    image: localstack/localstack:4.13.1
+    ports:
+      - "127.0.0.1:4566:4566"            
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DEBUG=1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
