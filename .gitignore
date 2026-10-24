@@ -1,5 +1,6 @@
 # OpenTofu / Terraform state e cache local
 **/.terraform/*
+**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
@@ -19,6 +20,7 @@ terraform.rc
 environments/aws-prod/terraform.tfvars
 environments/aws-prod/backend.hcl
 
-# Dados locais do emulador Floci
+# Dados locais do emulador Floci e notas pessoais de estudo
 data/
 floci-data/
+docs/
