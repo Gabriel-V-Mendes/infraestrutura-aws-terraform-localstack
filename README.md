@@ -119,16 +119,26 @@ flowchart LR
 │   ├── verify-oidc.sh               # Valida sts:AssumeRoleWithWebIdentity emitindo SessionToken temporário
 │   ├── lifecycle-test.sh            # Orquestra init -> validate -> plan -> apply -> smoke -> OIDC -> destroy
 │   └── protect-main.sh              # Ativa branch protection exigindo os 4 checks verdes na main
-├── docs/
-│   └── GUIA_DE_ESTUDO.md            # Guia didático detalhado de arquitetura, FinOps, OIDC e Runbooks
 └── .github/workflows/infra-ci.yml   # Pipeline declarativo completo com PR Plan Comment
 ```
+
+### 2.4 Inventário dos 37 Recursos Provisionados (6 Módulos)
+
+| Módulo | Qtd | Recursos Gerenciados (`tofu state list`) | Função Principal |
+|---|:---:|---|---|
+| [`modules/budget-alerts`](modules/budget-alerts/main.tf) | **4** | `aws_budgets_budget.monthly_cost`, `aws_sns_topic.alerts`, `aws_sns_topic_subscription.email[0]`, `aws_cloudwatch_metric_alarm.cpu_high` | Orçamento mensal (US$ 15) com alertas em 50%/80%/100% (atual e previsto) e alarme de CPU > 80% |
+| [`modules/iam-oidc`](modules/iam-oidc/main.tf) | **6** | `aws_iam_openid_connect_provider.github_actions`, `aws_iam_role.github_actions_oidc`, `aws_iam_role_policy.github_actions_iac`, `aws_iam_role.ec2_app`, `aws_iam_role_policy.ec2_app_least_privilege`, `aws_iam_instance_profile.ec2_app` | Federação OIDC (`token.actions.githubusercontent.com`) sem chaves estáticas e perfil de instância EC2 com menor privilégio |
+| [`modules/storage`](modules/storage/main.tf) | **7** | `aws_kms_key.main`, `aws_kms_alias.main`, `aws_s3_bucket.artifacts`, `aws_s3_bucket_versioning.artifacts`, `aws_s3_bucket_server_side_encryption_configuration.artifacts`, `aws_s3_bucket_public_access_block.artifacts`, `aws_s3_bucket_lifecycle_configuration.artifacts` | Chave KMS com rotação anual + Bucket S3 versionado, criptografado (`aws:kms`), 100% privado e com regra de lifecycle |
+| [`modules/network`](modules/network/main.tf) | **10** | `aws_vpc.main`, `aws_internet_gateway.main`, `aws_subnet.public[0..1]`, `aws_route_table.public`, `aws_route_table_association.public[0..1]`, `aws_security_group.alb`, `aws_security_group.app`, `aws_security_group.db` | VPC (`10.20.0.0/16` no Floci / `10.0.0.0/16` em Prod), 2 Subnets Públicas Multi-AZ (**0 NAT Gateways**) e 3 Security Groups encadeados |
+| [`modules/database`](modules/database/main.tf) | **5** | `aws_db_subnet_group.main`, `aws_db_instance.postgres`, `aws_secretsmanager_secret.database_url`, `aws_secretsmanager_secret_version.database_url`, `aws_ssm_parameter.db_endpoint` | RDS PostgreSQL Single-AZ (`db.t4g.micro`, `gp3` KMS, `publicly_accessible = false`) + `DATABASE_URL` no Secrets Manager |
+| [`modules/compute`](modules/compute/main.tf) | **5** | `aws_lb.app`, `aws_lb_target_group.app`, `aws_lb_listener.http`, `aws_launch_template.app`, `aws_autoscaling_group.app` | Application Load Balancer, Target Group (`/health/ready`), Launch Template (`t3.micro`, IMDSv2 obrigatório, EBS KMS) e ASG (1 instância) |
+| **Total** | **37** | **0 chaves estáticas · 0 NAT Gateways · 0 tabelas DynamoDB** | **Stack completa reproduzível do zero** |
 
 ---
 
 ## 3. Subir e testar tudo com um comando
 
-Pré-requisitos: Docker (com Compose v2), OpenTofu (`>= 1.10`), AWS CLI v2, `jq` e `trivy`.
+Pré-requisitos: Docker (com Compose v2), OpenTofu (`>= 1.10`), AWS CLI v2, `jq`, `trivy` e `gitleaks`.
 
 ```bash
 make test     # Sobe o Floci e executa: bootstrap S3 -> init -> validate -> plan -> apply -> smoke -> OIDC -> destroy
@@ -137,16 +147,47 @@ make test     # Sobe o Floci e executa: bootstrap S3 -> init -> validate -> plan
 Se quiser inspecionar os recursos ativos antes de destruir:
 
 ```bash
-make up       # Sobe o Floci em background (~1.5s) na porta 127.0.0.1:4566
+make up       # Sobe o Floci em background (~3s) na porta 127.0.0.1:4566
 make apply    # Inicializa o backend S3 com lock nativo e provisiona os 37 recursos
 make smoke    # Executa 7 baterias de verificação via AWS CLI contra o Floci
 make oidc     # Testa a federação OIDC (sts:AssumeRoleWithWebIdentity) sem chaves estáticas
 make destroy  # Derruba todos os 37 recursos ao final
-make down     # Desliga o container do Floci
+make down     # Desliga o container do Floci e remove o volume temporário
+```
+
+### 3.1 Resultado Real da Suíte de Validação (`make scan secrets test down`)
+
+Saída verificada localmente e no GitHub Actions:
+
+```text
+1. make scan (trivy config --severity CRITICAL,HIGH --exit-code 1 .)
+   ├── environments/aws-prod    : 0 misconfigurations
+   ├── environments/floci-local : 0 misconfigurations
+   ├── modules/compute/main.tf  : 0 misconfigurations
+   ├── modules/database/main.tf : 0 misconfigurations
+   ├── modules/network/main.tf  : 0 misconfigurations
+   └── modules/storage/main.tf  : 0 misconfigurations
+
+2. make secrets (gitleaks git & dir)
+   └── commits & working tree scanned -> no leaks found (0 chaves estáticas)
+
+3. make test (scripts/lifecycle-test.sh contra floci/floci:2.3.0)
+   ├── [Bootstrap] Bucket 'devops-api-tofu-state' pronto para state + lock nativo (.tflock)
+   ├── [OpenTofu]  Backend S3 inicializado (use_lockfile = true) + Config validada
+   ├── [Apply]     Apply complete! Resources: 37 added, 0 changed, 0 destroyed.
+   ├── [Smoke 1/7] State remoto gravado em s3://devops-api-tofu-state/floci-local/terraform.tfstate
+   ├── [Smoke 2/7] Bucket S3 'devops-api-floci-artifacts' com Versioning=Enabled e SSE-KMS
+   ├── [Smoke 3/7] FinOps: Orçamento mensal ativo (US$ 15.0) + SNS Topic + CloudWatch Alarm
+   ├── [Smoke 4/7] IAM OIDC Provider (token.actions.githubusercontent.com) + Roles criadas
+   ├── [Smoke 5/7] VPC (10.20.0.0/16), 2 Subnets Públicas, 0 NAT Gateways e 3 SGs estritos
+   ├── [Smoke 6/7] RDS PostgreSQL Single-AZ (MultiAZ=False) + Secrets Manager DATABASE_URL
+   ├── [Smoke 7/7] ALB (active) + Target Group (/health/ready) + ASG (DesiredCapacity=1)
+   ├── [OIDC]      sts:AssumeRoleWithWebIdentity -> AssumedRoleUser + Temporary AccessKeyId (ASIAR8W3***)
+   └── [Destroy]   Destroy complete! Resources: 37 destroyed.
 ```
 
 > [!TIP]
-> **Console Web da Floci:** Com o emulador rodando (`make up`), acesse `http://localhost:4566/_floci/ui` no navegador (se o socket Docker estiver montado) ou consulte diretamente via `aws --endpoint-url http://localhost:4566 ...`.
+> **Endpoint & Healthcheck da Floci:** Com o emulador rodando (`make up`), consulte o status em `http://localhost:4566/_floci/health` ou inspecione qualquer recurso via `aws --endpoint-url http://localhost:4566 ...`.
 
 ---
 
@@ -157,35 +198,55 @@ make down     # Desliga o container do Floci
 2. **Floci é 100% Open-Source (MIT), leve e sem travas:** Construído em Quarkus + GraalVM nativo (~13 MiB de RAM em repouso e ~24 ms de boot), o Floci emula **S3, IAM, STS (incluindo OIDC), VPC, EC2, Auto Scaling, ELBv2 (ALB), RDS PostgreSQL, KMS, Secrets Manager, SSM, CloudWatch e AWS Budgets** na porta `4566` sem conta e sem token.
 
 ### 4.2 State em S3 com Lock Nativo (`use_lockfile = true`, sem DynamoDB)
-A partir do OpenTofu 1.10 / Terraform 1.10, o backend `s3` suporta **S3 Native State Locking** por meio do atributo `use_lockfile = true` em [`environments/floci-local/backend.hcl`](environments/floci-local/backend.hcl):
+A partir do OpenTofu 1.10 / Terraform 1.10, o backend `s3` suporta **S3 Native State Locking** por meio do atributo `use_lockfile = true` em [`environments/floci-local/backend.hcl`](environments/floci-local/backend.hcl) e [`environments/aws-prod/backend.hcl.example`](environments/aws-prod/backend.hcl.example):
 - O OpenTofu cria um arquivo `.tflock` diretamente no bucket S3 usando cabeçalhos de escrita condicional (`If-None-Match: *`).
 - **Resultado:** A tabela `aws_dynamodb_table.terraform_locks` que existia na versão antiga foi **100% eliminada**, reduzindo complexidade e superfície de manutenção.
 
 ### 4.3 Autenticação OIDC sem Chaves Estáticas
 - **Zero chaves no código:** Nenhum arquivo `.tf` ou `.hcl` contém `access_key` ou `secret_key`.
 - **Provedor e Role provisionados via IaC:** O módulo [`modules/iam-oidc`](modules/iam-oidc/main.tf) cria o `aws_iam_openid_connect_provider` para `https://token.actions.githubusercontent.com` e a `aws_iam_role` com *Trust Policy* restrita exclusivamente a `repo:Gabriel-V-Mendes/infraestrutura-aws-terraform-localstack:*`.
-- **Testado de verdade no CI:** O script [`scripts/verify-oidc.sh`](scripts/verify-oidc.sh) executa `aws sts assume-role-with-web-identity` contra o STS da Floci passando um JWT OIDC e valida a emissão de `AccessKeyId` + `SessionToken` temporários.
+- **Testado de verdade no CI:** O script [`scripts/verify-oidc.sh`](scripts/verify-oidc.sh) executa `aws sts assume-role-with-web-identity` contra o STS da Floci passando um JWT OIDC e valida a emissão de `AccessKeyId` (`ASIA...`) + `SessionToken` temporários.
 
-### 4.4 Segurança Estática (Trivy Config & Checkov)
+### 4.4 Segurança Estática (Trivy Config & Gitleaks) e Ajustes Técnicos
 ```bash
 make scan     # trivy config --severity CRITICAL,HIGH --exit-code 1 .
 make secrets  # gitleaks git & dir
 ```
-Todos os módulos implementam **IMDSv2 obrigatório** (`http_tokens = "required"`), **criptografia KMS** em repouso (S3, RDS, EBS, SNS, Secrets Manager, SSM), **bloqueio total de acesso público no S3** e **Security Groups encadeados pelo menor privilégio** (`Internet -> ALB:80/443 -> EC2:8000 -> RDS:5432`).
+- **IMDSv2 obrigatório (`http_tokens = "required"`):** Configurado no `aws_launch_template` para impedir ataques de SSRF ao serviço de metadados da instância.
+- **Criptografia KMS (`aws_kms_key`) em repouso:** Habilitada em S3, RDS (`storage_encrypted = true`), EBS, SNS, Secrets Manager e SSM Parameter Store.
+- **Política IAM S3 de menor privilégio (correção `AWS-0345`):** As permissões S3 da Role do GitHub Actions em [`modules/iam-oidc/main.tf`](modules/iam-oidc/main.tf) são restritas apenas aos buckets do projeto (`arn:aws:s3:::${var.project_name}-*`), sem curingas `s3:*` globais.
+- **Resolução dinâmica de `account_id` no AWS Budgets:** O módulo [`modules/budget-alerts/main.tf`](modules/budget-alerts/main.tf) obtém o ID da conta via `data.aws_caller_identity.current.account_id` (`000000000000` na Floci), garantindo compatibilidade mesmo quando `skip_requesting_account_id = true`.
+- **Execução determinística de Control-Plane no CI:** O [`docker-compose.yml`](docker-compose.yml) configura `FLOCI_SERVICES_EC2_MOCK=true`, `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES=fixed`, `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=false` e `FLOCI_SERVICES_RDS_MOCK=true`, permitindo testar todo o ciclo de vida em runners não privilegiados do GitHub Actions em poucos segundos.
 
 ---
 
-## 5. CI/CD e Comentário do `plan` no Pull Request
+## 5. CI/CD, Comentário do `plan` no PR e Proteção de Branch
 
 Arquivo: [`.github/workflows/infra-ci.yml`](.github/workflows/infra-ci.yml)
 
 | Job | Quando roda | O que faz | Falha se |
 |---|---|---|---|
-| **Format & Validate** | PR e push | `tofu fmt -check` + `tofu validate` em `floci-local` e `aws-prod` | Código fora do padrão ou erro de validação |
-| **Secret Scan** | PR e push | `gitleaks` em todo o histórico (`fetch-depth: 0`) | Qualquer chave estática ou segredo for detectado |
-| **IaC Security Scan** | PR e push | `trivy config` varrendo todos os módulos e ambientes | Houver qualquer misconfiguration `CRITICAL` ou `HIGH` |
-| **E2E Apply, OIDC & Destroy** | Após os 3 acima | Sobe o Floci → Bootstrap S3 → `tofu init` → `tofu plan` → **Comenta o Plan + Tabela FinOps no PR** → `tofu apply` (37 recursos) → `smoke-infra.sh` → `verify-oidc.sh` → `tofu destroy` | Qualquer etapa do ciclo de vida ou smoke test falhar |
+| **Format & Validate (OpenTofu)** | PR e push | `tofu fmt -check -recursive` + `tofu validate` em `floci-local` e `aws-prod` | Código fora do padrão ou erro de validação |
+| **Secret Scan (Gitleaks)** | PR e push | `gitleaks` em todo o histórico (`fetch-depth: 0`) | Qualquer chave estática ou segredo for detectado |
+| **IaC Security Scan (Trivy Config)** | PR e push | `trivy config` varrendo todos os módulos e ambientes | Houver qualquer misconfiguration `CRITICAL` ou `HIGH` |
+| **E2E Apply, OIDC & Destroy (Floci)** | Após os 3 acima | Sobe o Floci → Bootstrap S3 → `tofu init` → `tofu plan` → **Comenta o Plan + Tabela FinOps no PR** → `tofu apply` (37 recursos) → `smoke-infra.sh` → `verify-oidc.sh` → `tofu destroy` | Qualquer etapa do ciclo de vida ou smoke test falhar |
 | **Deploy AWS Prod (OIDC)** | Push na `main` se `AWS_PROD_ENABLED=true` | Assume a IAM Role na AWS real via OIDC (`id-token: write`) e executa o OpenTofu | Falha de federação OIDC ou plano inválido |
+
+### 5.1 Proteção da Branch `main` e Comentário Automático no PR
+
+A branch `main` é protegida via [`scripts/protect-main.sh`](scripts/protect-main.sh) (`make protect-main`), exigindo Pull Request atualizado, histórico linear e os **4 status checks obrigatórios** verdes antes de liberar o merge (inclusive para administradores).
+
+Para testar o comentário automático do `tofu plan` + tabela FinOps em um Pull Request:
+
+```bash
+git switch -c feat/ajuste-tag-orcamento
+# Faça um pequeno ajuste em environments/floci-local/variables.tf
+git commit -am "feat: ajusta limite de alerta do orçamento"
+git push -u origin feat/ajuste-tag-orcamento
+gh pr create --fill
+```
+
+Assim que o job **E2E Apply, OIDC & Destroy (Floci)** executar no PR, o bot `github-actions[bot]` publicará (ou atualizará) um comentário no próprio PR contendo a tabela de custos por hora/mês e a saída completa do `tofu plan`.
 
 ---
 
@@ -264,9 +325,3 @@ Para quem abre uma **nova conta AWS** no modelo atual de Free Tier baseado em cr
 2. **Certificado TLS (ACM) + Redirecionamento HTTP → HTTPS no ALB:** Com um domínio no Route53, adicionaria um listener na porta `443` com certificado gratuito do AWS Certificate Manager (ACM).
 3. **State Encryption Nativo do OpenTofu (`encryption {}` block):** Criptografaria o próprio conteúdo do `.tfstate` em trânsito e repouso usando chave KMS antes mesmo de enviá-lo ao S3.
 4. **ECS Fargate Spot ou AWS App Runner:** Para cargas variáveis, substituir o ALB + EC2 por Fargate Spot ou App Runner pode reduzir ainda mais o custo base do Load Balancer.
-
----
-
-## Documentação Complementar
-
-Consulte o **[Guia Completo de Estudo (`docs/GUIA_DE_ESTUDO.md`)](docs/GUIA_DE_ESTUDO.md)** para a explicação passo a passo de cada módulo HCL, como funciona o handshake OIDC, a anatomia dos Security Groups e o laboratório prático de troubleshooting.
