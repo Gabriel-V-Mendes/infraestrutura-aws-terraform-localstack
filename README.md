@@ -267,6 +267,4 @@ Para quem abre uma **nova conta AWS** no modelo atual de Free Tier baseado em cr
 
 ---
 
-## Documentação Complementar
 
-Consulte o **[Guia Completo de Estudo (`docs/GUIA_DE_ESTUDO.md`)](docs/GUIA_DE_ESTUDO.md)** para a explicação passo a passo de cada módulo HCL, como funciona o handshake OIDC, a anatomia dos Security Groups e o laboratório prático de troubleshooting.
