@@ -1,0 +1,7 @@
+project_name       = "devops-api"
+environment        = "floci"
+aws_region         = "us-east-1"
+floci_endpoint     = "http://localhost:4566"
+monthly_budget_usd = "15.0"
+ec2_instance_type  = "t3.micro"
+db_instance_class  = "db.t4g.micro"

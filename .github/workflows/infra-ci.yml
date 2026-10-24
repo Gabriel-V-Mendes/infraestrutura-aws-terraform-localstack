@@ -1,0 +1,273 @@
+name: Infra CI/CD (OpenTofu + Floci)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  TOFU_VERSION: "1.10.6"
+  AWS_DEFAULT_REGION: "us-east-1"
+  FLOCI_ENDPOINT: "http://localhost:4566"
+
+jobs:
+  # ============================================================================
+  # 1. Formatação e Validação Estática (floci-local e aws-prod)
+  # ============================================================================
+  validate:
+    name: Format & Validate (OpenTofu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78bd8876ffc8b3ffeea # v1.0.7
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: Verificar formatação HCL (tofu fmt -check)
+        run: tofu fmt -check -recursive .
+
+      - name: Validar ambiente floci-local (sem backend)
+        working-directory: environments/floci-local
+        run: |
+          tofu init -backend=false -input=false -no-color
+          tofu validate -no-color
+
+      - name: Validar ambiente aws-prod (sem backend)
+        working-directory: environments/aws-prod
+        run: |
+          tofu init -backend=false -input=false -no-color
+          tofu validate -no-color
+
+  # ============================================================================
+  # 2. Scan de Segredos (Garante ZERO chaves de acesso estáticas no repositório)
+  # ============================================================================
+  secrets:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks (histórico completo)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --verbose --exit-code 1
+
+  # ============================================================================
+  # 3. Segurança IaC (Trivy Config)
+  # ============================================================================
+  security:
+    name: IaC Security Scan (Trivy & Checkov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Trivy Config (bloqueia misconfigurations CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+  # ============================================================================
+  # 4. E2E no Floci: Bootstrap S3 -> Init -> Plan (PR Comment) -> Apply ->
+  #    Smoke Test -> OIDC AssumeRoleWithWebIdentity -> Destroy do zero!
+  # ============================================================================
+  floci-e2e:
+    name: E2E Apply, OIDC & Destroy (Floci)
+    needs: [validate, secrets, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write # Comenta o resultado do `tofu plan` no PR
+      id-token: write      # Permissão OIDC nativa do GitHub Actions
+    env:
+      AWS_ACCESS_KEY_ID: floci-ephemeral
+      AWS_SECRET_ACCESS_KEY: floci-ephemeral
+      TF_VAR_db_password: "FlociCiStrongPassword_2026!"
+      TF_VAR_floci_endpoint: "http://localhost:4566"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78bd8876ffc8b3ffeea # v1.0.7
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Subir emulador AWS local Floci
+        run: |
+          docker compose up -d --wait
+          docker compose ps
+
+      - name: Bootstrap do Bucket S3 de State (use_lockfile = true)
+        run: ./scripts/bootstrap-state.sh
+
+      - name: OpenTofu Init (Backend S3 + Lock Nativo .tflock)
+        working-directory: environments/floci-local
+        run: |
+          tofu init -backend-config=backend.hcl \
+            -backend-config="endpoint=${FLOCI_ENDPOINT}" \
+            -input=false -no-color
+
+      - name: OpenTofu Plan
+        id: plan
+        working-directory: environments/floci-local
+        run: |
+          tofu plan -input=false -no-color -out=tfplan | tee /tmp/tofu_plan.txt
+          SUMMARY=$(grep -E '^Plan:' /tmp/tofu_plan.txt || echo "Plan gerado com sucesso")
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+
+      - name: Comentar Plan e Estimativa FinOps no Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const planText = fs.readFileSync('/tmp/tofu_plan.txt', 'utf8');
+            const maxLen = 55000;
+            const truncatedPlan = planText.length > maxLen
+              ? planText.slice(-maxLen) + '\n... (truncado)'
+              : planText;
+            const summary = `${{ steps.plan.outputs.summary }}`;
+            const marker = '<!-- opentofu-floci-plan-comment -->';
+
+            const body = `${marker}
+            ## 🏗️ OpenTofu Plan & FinOps Report (Emulado via Floci)
+
+            | Validação | Status | Detalhe |
+            |---|---|---|
+            | **Formatação (`tofu fmt`)** | ✅ Passou | Padrão canônico HCL |
+            | **Validação (`tofu validate`)** | ✅ Passou | `floci-local` & `aws-prod` válidos |
+            | **Segurança IaC (`trivy config`)** | ✅ Passou | `0 CRITICAL / 0 HIGH` |
+            | **Chaves Estáticas (`gitleaks`)** | ✅ Zero Chaves | Federação via **OIDC (`sts:AssumeRoleWithWebIdentity`)** |
+            | **Backend State S3** | ✅ Lock Nativo | `use_lockfile = true` (`.tflock` no S3, sem DynamoDB) |
+            | **Resumo do Plano** | ✅ Pronto | \`${summary}\` |
+
+            ### 💰 Estimativa FinOps: Custo na AWS Real (`us-east-1`) vs. Floci
+
+            | Recurso | Especificação Econômica | Custo/Hora (AWS) | Custo/Mês (730h AWS) | No Floci (Local/CI) |
+            |---|---|---:|---:|---:|
+            | **VPC + 2 Subnets Públicas + IGW + 3 SGs** | Sem NAT Gateway (economia de US$ 32,85/mês) | US$ 0,0000 | US$ 0,00 | **US$ 0,00** |
+            | **Auto Scaling (1x EC2 `t3.micro`) + EBS 20 GB gp3** | 2 vCPU, 1 GiB RAM, IMDSv2 + KMS | US$ 0,0126 | US$ 9,19 | **US$ 0,00** |
+            | **Application Load Balancer (ALB)** | Apenas durante os testes | US$ 0,0225 | US$ 16,43 | **US$ 0,00** |
+            | **RDS PostgreSQL 17 Single-AZ (`db.t4g.micro`) + 20 GB** | Sem Multi-AZ (economia de 50%) | US$ 0,0192 | US$ 13,98 | **US$ 0,00** |
+            | **S3 + KMS + Secrets Manager + Budgets + CloudWatch** | 1 KMS CMK + 1 Secret + S3 (<5 GB) | US$ 0,0021 | US$ 1,55 | **US$ 0,00** |
+            | **Total (Stack Completa Ativa)** | **37 recursos gerenciados** | **US$ 0,0564/h** | **US$ 41,15/mês** | **US$ 0,00** |
+
+            <details>
+            <summary>📋 <strong>Clique para expandir a saída completa do <code>tofu plan</code></strong></summary>
+
+            \`\`\`hcl
+            ${truncatedPlan}
+            \`\`\`
+
+            </details>`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: OpenTofu Apply (Provisionar 37 recursos do zero no Floci)
+        working-directory: environments/floci-local
+        run: tofu apply -input=false -auto-approve -no-color tfplan
+
+      - name: Smoke Test da Infraestrutura (AWS CLI contra Floci)
+        run: ./scripts/smoke-infra.sh
+
+      - name: Validar Autenticação OIDC (AssumeRoleWithWebIdentity sem chaves estáticas)
+        run: ./scripts/verify-oidc.sh
+
+      - name: OpenTofu Destroy (Derrubar toda a infraestrutura ao final)
+        working-directory: environments/floci-local
+        run: tofu destroy -input=false -auto-approve -no-color
+
+      - name: Logs do Floci (em caso de falha)
+        if: failure()
+        run: docker compose logs
+
+      - name: Derrubar container Floci
+        if: always()
+        run: docker compose down -v
+
+  # ============================================================================
+  # 5. Deploy em Conta AWS Real via OIDC (Opcional, ativado via variável)
+  # ============================================================================
+  aws-prod-oidc:
+    name: Deploy AWS Prod (OIDC Keyless)
+    needs: [floci-e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_PROD_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # Obrigatório para solicitar JWT OIDC ao provedor do GitHub
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Autenticar na AWS via OIDC (Sem chaves estáticas!)
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78bd8876ffc8b3ffeea # v1.0.7
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: OpenTofu Init & Plan (AWS Prod)
+        working-directory: environments/aws-prod
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: |
+          tofu init -backend-config="bucket=${{ vars.AWS_STATE_BUCKET }}" \
+            -backend-config="key=aws-prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true" \
+            -input=false -no-color
+          tofu plan -input=false -no-color

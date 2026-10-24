@@ -1,0 +1,24 @@
+# OpenTofu / Terraform state e cache local
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Segredos e variáveis locais sensíveis (nunca commitar!)
+.env
+*.auto.tfvars
+environments/aws-prod/terraform.tfvars
+environments/aws-prod/backend.hcl
+
+# Dados locais do emulador Floci
+data/
+floci-data/

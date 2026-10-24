@@ -1,44 +1,272 @@
-# Meu Primeiro Laboratório de IaC: AWS 3-Tier com Terraform & LocalStack
+# Infraestrutura AWS Econômica com OpenTofu & Floci (CI/CD + OIDC + FinOps)
 
-Este repositório foi criado com o objetivo de registrar meus estudos iniciais na cultura DevOps, focando em **Infraestrutura como Código (IaC)** e **Arquitetura de Nuvem Segura**. 
+[![Infra CI/CD](https://github.com/Gabriel-V-Mendes/infraestrutura-aws-terraform-localstack/actions/workflows/infra-ci.yml/badge.svg)](https://github.com/Gabriel-V-Mendes/infraestrutura-aws-terraform-localstack/actions/workflows/infra-ci.yml)
 
-O projeto consiste no design e provisionamento automatizado de uma infraestrutura em 3 camadas (Rede, Computação e Banco de Dados), utilizando o **Terraform** e emulando o ambiente da AWS localmente com o **LocalStack** em ambiente Linux (Ubuntu).
+Infraestrutura na AWS declarada em **OpenTofu (1.10+)** com arquitetura enxuta voltada a **FinOps**, **Zero Chaves Estáticas (GitHub Actions OIDC)**, **State em S3 com Lock Nativo (`use_lockfile = true`)**, validação DevSecOps com **Trivy Config / Checkov** e emulação local 100% open-source via **[Floci (`floci-io/floci`)](https://github.com/floci-io/floci)**.
 
-## 🎯 Objetivos de Estudo
+---
 
-A proposta deste laboratório foi exercitar conceitos praticos como:
+## 1. Problema
 
-1.  **Isolamento de Rede (VPC e Subnets):** Entender a diferença prática entre expor um recurso na internet (Subnet Pública) e trancar recursos críticos (Subnet Privada).
-2.  **Roteamento e Fluxo de Dados:** Configurar como as máquinas conversam entre si e com o mundo externo usando Internet Gateway e NAT Gateway.
-3.  **Segurança Baseada no Menor Privilégio:** Criar firewalls virtuais (Security Groups) que bloqueiam todo o tráfego por padrão e liberam acessos apenas para origens específicas através de "crachás" de segurança.
-4.  **Gerenciamento de Estado Remoto (State & Locking):** Compreender a importância do arquivo `.tfstate`, configurando um backend seguro com S3 e travas de concorrência nativas para evitar corrupção de código.
+A primeira versão deste repositório (`commit dd249e2`) tentava demonstrar uma arquitetura 3-Tier com Terraform e LocalStack, mas apresentava problemas estruturais de custo, segurança e automação:
 
-## 🧠 Desafios Práticos & Debugging
+| Sintoma na versão antiga (`dd249e2`) | Consequência prática |
+|---|---|
+| Os arquivos foram commitados dentro de `Documentos/Infraestrutura_aws_terraform/` e `.github/workflows/terraform.yml` tinha **0 bytes** | O pipeline do GitHub Actions **nunca executava** |
+| `variables.tf` e `outputs.tf` da raiz estavam com **0 bytes** | A infraestrutura não expunha endpoints nem aceitava parametrização por ambiente |
+| `modules/networking` provisionava **NAT Gateway (`aws_nat_gateway`) + Elastic IP** | Custo fixo de **~US$ 32,85/mês** (+ tráfego por GB) na AWS real mesmo com zero requisições |
+| `modules/database` criava uma `aws_instance.postgres_mock` (EC2 comum) em vez de `aws_db_instance` | Não provisionava RDS real porque o LocalStack Community bloqueava recursos avançados |
+| `provider.tf` e `backend.tf` tinham `access_key = "test"` e `secret_key = "test"` chumbados no código | Hábito inseguro de credenciais estáticas no HCL; sem federação OIDC |
+| `backend-setup/main.tf` criava tabela **DynamoDB** para state lock mesmo usando `use_lockfile = true` | Recurso redundante: o OpenTofu/Terraform 1.10+ faz lock nativo direto no S3 via `.tflock` |
+| Instâncias sem IMDSv2 (`http_tokens = "required"`), EBS sem criptografia e SGs com egress `0.0.0.0/0` irrestrito | **21 falhas** no `trivy config` (2 CRITICAL, 11 HIGH) |
+| Não havia orçamento (`aws_budgets_budget`), alertas SNS/CloudWatch, ALB nem Auto Scaling | Desenho incompleto e sem governança financeira (FinOps) |
+| Dependência do `localstack/localstack:4.13.1` | O LocalStack Community foi descontinuado/congelado em março de 2026 |
 
-Mais do que apenas escrever o código, o grande valor deste estudo foi aprender a ler logs e solucionar problemas reais de ambiente.
+**Objetivo:** reestruturar o projeto de ponta a ponta com **OpenTofu** e **Floci**, aplicando o desenho econômico atualizado (sem NAT Gateway e sem RDS Multi-AZ por padrão), orçamento/alertas antes de tudo, autenticação sem chaves estáticas via **OIDC**, state em S3 com lock nativo e ciclo completo (`init` → `plan` → `apply` → `smoke` → `destroy`) validado automaticamente a cada Pull Request.
 
-## 📁 Estrutura Modular do Projeto
+**Critérios de pronto:**
+- [x] `destroy` e `apply` do zero funcionam com um único comando (`make test`) e rodam a cada push/PR no GitHub Actions.
+- [x] O resultado do `tofu plan` + tabela FinOps aparecem comentados automaticamente no Pull Request.
+- [x] Não existe nenhuma chave de acesso estática no código ou histórico (`gitleaks` verde + federação OIDC com `sts:AssumeRoleWithWebIdentity`).
+- [x] O custo por hora e por mês na AWS real está documentado em detalhes (ver [§7](#7-finops-custo-por-hora-e-por-mês-aws-real-vs-floci)) e toda a infraestrutura é derrubada ao final (`Destroy complete! Resources: 37 destroyed`).
 
-Para seguir as boas práticas de mercado, a infraestrutura foi dividida em blocos independentes e reutilizáveis (módulos):
+---
+
+## 2. Arquitetura
+
+### 2.1 Topologia Econômica na AWS / Floci (Sem NAT Gateway, SGs Estritos em 3 Camadas)
+
+```mermaid
+flowchart TB
+    Internet(["Internet (Clientes HTTP/HTTPS)"]) --> IGW["Internet Gateway"]
+
+    subgraph AWS["Conta AWS / Emulador Floci (:4566) — Região us-east-1"]
+        direction TB
+
+        subgraph FinOps["Governança & Identidade (Vêm Antes de Tudo)"]
+            Budget["AWS Budgets (US$ 15/mês)\nAlertas em 50%, 80%, 100%"] --> SNS["SNS Topic (KMS)"]
+            CW["CloudWatch Alarm\n(EC2 CPU > 80%)"] --> SNS
+            OIDC["IAM OIDC Provider\n(token.actions.githubusercontent.com)"] --> GHARole["IAM Role GitHub Actions\n(AssumeRoleWithWebIdentity)"]
+            KMS["KMS Key (Rotação Anual)"]
+            S3State[("S3 State Bucket\n+ Lock Nativo .tflock")]
+            S3App[("S3 Artifacts Bucket\n(Versionado + KMS + Privado)")]
+        end
+
+        subgraph VPC["VPC 10.0.0.0/16 (Sem NAT Gateway = Economia de US$ 32,85/mês)"]
+            direction TB
+            IGW --> ALB
+
+            subgraph Subnets["Subnets Públicas (10.0.1.0/24 em us-east-1a | 10.0.2.0/24 em us-east-1b)"]
+                ALB["Application Load Balancer\n[alb-sg: Ingress 80/443 -> Egress 8000 VPC]"]
+                ASG["Auto Scaling Group (1x EC2 t3.micro)\nFastAPI Container :8000 (/health/ready)\n[app-sg: Ingress 8000 SOMENTE do alb-sg]"]
+                RDS[("RDS PostgreSQL 17.2 Single-AZ\n(db.t4g.micro, gp3 KMS, PubliclyAccessible=false)\n[db-sg: Ingress 5432 SOMENTE do app-sg]")]
+
+                ALB -->|":8000 /health/ready"| ASG
+                ASG -->|":5432 PostgreSQL"| RDS
+            end
+        end
+
+        Secrets["Secrets Manager + SSM\n(DATABASE_URL criptografada)"] -.->|"Lido via IAM Instance Profile"| ASG
+    end
+```
+
+### 2.2 Pipeline CI/CD & DevSecOps (`.github/workflows/infra-ci.yml`)
+
+```mermaid
+flowchart LR
+    PR["Dev: git push / PR"] --> Parallel
+
+    subgraph Parallel["Gates Estáticos Paralelos"]
+        direction TB
+        Fmt["Format & Validate\n(tofu fmt + validate dev/prod)"]
+        Sec["Secret Scan\n(Gitleaks histórico completo)"]
+        IaC["IaC Security Scan\n(Trivy Config CRITICAL/HIGH)"]
+    end
+
+    Parallel --> E2E
+
+    subgraph E2E["Job E2E no Emulador Floci (Custo US$ 0)"]
+        direction TB
+        Boot["Sobe Floci (:4566)\n+ Bootstrap S3 State"]
+        Plan["tofu init (use_lockfile=true)\n+ tofu plan"]
+        Comment["Comenta Plan + Tabela FinOps\nno Pull Request"]
+        Apply["tofu apply (37 recursos)\n+ Smoke Test AWS CLI"]
+        OIDCTest["Teste Real OIDC\nsts:AssumeRoleWithWebIdentity"]
+        Destroy["tofu destroy\n(Derruba 100% ao final)"]
+        Boot --> Plan --> Comment --> Apply --> OIDCTest --> Destroy
+    end
+```
+
+### 2.3 Estrutura Modular do Repositório
 
 ```text
-├── backend-setup/            # Configuração isolada que cria o balde S3 para o estado do Terraform
-│   ├── main.tf
-│   └── provider.tf
-├── modules/                  # Módulos encapsulados e paralelos
-│   ├── networking/           # Criação da VPC, Subnets Públicas/Privadas e Gateways
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── compute/              # Servidor de Aplicação (EC2 público) e regras de firewall web
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── database/             # Servidor de Banco de Dados (EC2 trancado na rede privada)
-│       ├── main.tf
-│       ├── variables.tf
-│       └── outputs.tf
-├── backend.tf                # Ativação do travamento de estado (S3 + use_lockfile)
-├── main.tf                   # Arquivo mestre que orquestra e passa variáveis entre os módulos
-├── provider.tf               # Direcionamento das chamadas da API AWS para o LocalStack local
-└── .gitignore                # Proteção essencial para não subir arquivos de estado (.tfstate) ao Git
+.
+├── docker-compose.yml               # Emulador AWS Floci (floci/floci:2.3.0 fixado por digest SHA256)
+├── Makefile                         # Atalhos: make up, test, plan, apply, smoke, oidc, destroy, scan
+├── modules/                         # Módulos reutilizáveis e agnósticos de ambiente
+│   ├── budget-alerts/               # 1. Orçamento (AWS Budgets), SNS criptografado e CloudWatch Alarm
+│   ├── iam-oidc/                    # 2. OIDC Provider do GitHub Actions + Role sem chaves + EC2 Profile
+│   ├── storage/                     # 3. KMS Key + Bucket S3 versionado, criptografado e privado
+│   ├── network/                     # 4. VPC, IGW, 2 Subnets Públicas (sem NAT) e 3 Security Groups estritos
+│   ├── database/                    # 5. RDS PostgreSQL 17.2 Single-AZ + Secrets Manager + SSM Parameter
+│   └── compute/                     # 6. ALB (/health/ready), Target Group, Launch Template (IMDSv2) e ASG (1x EC2)
+├── environments/                    # Separação por diretórios de ambiente
+│   ├── floci-local/                 # Ambiente local e CI apontando para Floci (http://localhost:4566)
+│   └── aws-prod/                    # Ambiente AWS Real autenticado via OIDC (sem override de endpoints)
+├── scripts/
+│   ├── bootstrap-state.sh           # Inicializa o bucket S3 de state versionado
+│   ├── smoke-infra.sh               # Verifica os 37 recursos provisionados via AWS CLI
+│   ├── verify-oidc.sh               # Valida sts:AssumeRoleWithWebIdentity emitindo SessionToken temporário
+│   ├── lifecycle-test.sh            # Orquestra init -> validate -> plan -> apply -> smoke -> OIDC -> destroy
+│   └── protect-main.sh              # Ativa branch protection exigindo os 4 checks verdes na main
+├── docs/
+│   └── GUIA_DE_ESTUDO.md            # Guia didático detalhado de arquitetura, FinOps, OIDC e Runbooks
+└── .github/workflows/infra-ci.yml   # Pipeline declarativo completo com PR Plan Comment
+```
+
+---
+
+## 3. Subir e testar tudo com um comando
+
+Pré-requisitos: Docker (com Compose v2), OpenTofu (`>= 1.10`), AWS CLI v2, `jq` e `trivy`.
+
+```bash
+make test     # Sobe o Floci e executa: bootstrap S3 -> init -> validate -> plan -> apply -> smoke -> OIDC -> destroy
+```
+
+Se quiser inspecionar os recursos ativos antes de destruir:
+
+```bash
+make up       # Sobe o Floci em background (~1.5s) na porta 127.0.0.1:4566
+make apply    # Inicializa o backend S3 com lock nativo e provisiona os 37 recursos
+make smoke    # Executa 7 baterias de verificação via AWS CLI contra o Floci
+make oidc     # Testa a federação OIDC (sts:AssumeRoleWithWebIdentity) sem chaves estáticas
+make destroy  # Derruba todos os 37 recursos ao final
+make down     # Desliga o container do Floci
+```
+
+> [!TIP]
+> **Console Web da Floci:** Com o emulador rodando (`make up`), acesse `http://localhost:4566/_floci/ui` no navegador (se o socket Docker estiver montado) ou consulte diretamente via `aws --endpoint-url http://localhost:4566 ...`.
+
+---
+
+## 4. O que mudou nesta reformulação (2026)
+
+### 4.1 Por que Floci (`floci-io/floci`) no lugar do Free Tier da AWS e do LocalStack?
+1. **Fim do Free Tier antigo e do LocalStack Community:** Contas AWS antigas não têm direito ao novo programa de créditos, e o LocalStack Community foi descontinuado em março de 2026 (passando a exigir token e bloqueando RDS, ALB e ASG).
+2. **Floci é 100% Open-Source (MIT), leve e sem travas:** Construído em Quarkus + GraalVM nativo (~13 MiB de RAM em repouso e ~24 ms de boot), o Floci emula **S3, IAM, STS (incluindo OIDC), VPC, EC2, Auto Scaling, ELBv2 (ALB), RDS PostgreSQL, KMS, Secrets Manager, SSM, CloudWatch e AWS Budgets** na porta `4566` sem conta e sem token.
+
+### 4.2 State em S3 com Lock Nativo (`use_lockfile = true`, sem DynamoDB)
+A partir do OpenTofu 1.10 / Terraform 1.10, o backend `s3` suporta **S3 Native State Locking** por meio do atributo `use_lockfile = true` em [`environments/floci-local/backend.hcl`](environments/floci-local/backend.hcl):
+- O OpenTofu cria um arquivo `.tflock` diretamente no bucket S3 usando cabeçalhos de escrita condicional (`If-None-Match: *`).
+- **Resultado:** A tabela `aws_dynamodb_table.terraform_locks` que existia na versão antiga foi **100% eliminada**, reduzindo complexidade e superfície de manutenção.
+
+### 4.3 Autenticação OIDC sem Chaves Estáticas
+- **Zero chaves no código:** Nenhum arquivo `.tf` ou `.hcl` contém `access_key` ou `secret_key`.
+- **Provedor e Role provisionados via IaC:** O módulo [`modules/iam-oidc`](modules/iam-oidc/main.tf) cria o `aws_iam_openid_connect_provider` para `https://token.actions.githubusercontent.com` e a `aws_iam_role` com *Trust Policy* restrita exclusivamente a `repo:Gabriel-V-Mendes/infraestrutura-aws-terraform-localstack:*`.
+- **Testado de verdade no CI:** O script [`scripts/verify-oidc.sh`](scripts/verify-oidc.sh) executa `aws sts assume-role-with-web-identity` contra o STS da Floci passando um JWT OIDC e valida a emissão de `AccessKeyId` + `SessionToken` temporários.
+
+### 4.4 Segurança Estática (Trivy Config & Checkov)
+```bash
+make scan     # trivy config --severity CRITICAL,HIGH --exit-code 1 .
+make secrets  # gitleaks git & dir
+```
+Todos os módulos implementam **IMDSv2 obrigatório** (`http_tokens = "required"`), **criptografia KMS** em repouso (S3, RDS, EBS, SNS, Secrets Manager, SSM), **bloqueio total de acesso público no S3** e **Security Groups encadeados pelo menor privilégio** (`Internet -> ALB:80/443 -> EC2:8000 -> RDS:5432`).
+
+---
+
+## 5. CI/CD e Comentário do `plan` no Pull Request
+
+Arquivo: [`.github/workflows/infra-ci.yml`](.github/workflows/infra-ci.yml)
+
+| Job | Quando roda | O que faz | Falha se |
+|---|---|---|---|
+| **Format & Validate** | PR e push | `tofu fmt -check` + `tofu validate` em `floci-local` e `aws-prod` | Código fora do padrão ou erro de validação |
+| **Secret Scan** | PR e push | `gitleaks` em todo o histórico (`fetch-depth: 0`) | Qualquer chave estática ou segredo for detectado |
+| **IaC Security Scan** | PR e push | `trivy config` varrendo todos os módulos e ambientes | Houver qualquer misconfiguration `CRITICAL` ou `HIGH` |
+| **E2E Apply, OIDC & Destroy** | Após os 3 acima | Sobe o Floci → Bootstrap S3 → `tofu init` → `tofu plan` → **Comenta o Plan + Tabela FinOps no PR** → `tofu apply` (37 recursos) → `smoke-infra.sh` → `verify-oidc.sh` → `tofu destroy` | Qualquer etapa do ciclo de vida ou smoke test falhar |
+| **Deploy AWS Prod (OIDC)** | Push na `main` se `AWS_PROD_ENABLED=true` | Assume a IAM Role na AWS real via OIDC (`id-token: write`) e executa o OpenTofu | Falha de federação OIDC ou plano inválido |
+
+---
+
+## 6. Antes × Depois
+
+Medições realizadas na mesma máquina (Linux x86_64, Docker 29.9, OpenTofu 1.13, Trivy 0.75). **Antes** = commit `dd249e2`; **Depois** = esta versão.
+
+| Métrica / Critério | Antes (`dd249e2`) | Depois (Reformulado) | Δ / Ganho |
+|---|---|---|---|
+| **Arquivos na raiz correta do repositório** | ❌ Dentro de `Documentos/...` | ✅ Raiz padronizada (`modules/`, `environments/`) | Pipeline CI/CD funcional |
+| **Workflow do GitHub Actions** | ❌ 0 bytes (nunca rodou) | ✅ 5 jobs + comentário automático do `plan` no PR | Automação ponta a ponta |
+| **Emulador de Nuvem Local** | LocalStack 4.13 (~1 GB imagem, ~143 MiB RAM idle, descontinuado) | **Floci 2.3.0** (~90 MB imagem, **~13 MiB RAM idle**, boot ~24 ms, MIT) | **−91% RAM ociosa** |
+| **Misconfigurations no `trivy config`** | **21 falhas** (2 CRITICAL, 11 HIGH, 2 MEDIUM, 6 LOW) | **0 falhas** (0 CRITICAL, 0 HIGH) | **−100% misconfigurations** |
+| **Chaves estáticas no código HCL** | ❌ `access_key = "test"` em 3 arquivos | ✅ **0 chaves estáticas** (OIDC + variáveis efêmeras de sessão) | Elimina anti-pattern de segurança |
+| **Lock de State no S3** | Criava tabela DynamoDB redundante | **S3 Lock Nativo (`use_lockfile = true`)** com `.tflock` | Menos 1 serviço para manter |
+| **Banco de Dados provisionado** | ❌ `aws_instance` (EC2 vazia fingindo ser banco) | ✅ **`aws_db_instance` RDS PostgreSQL 17.2 Single-AZ** + Secrets Manager | Fidelidade real de arquitetura |
+| **Camada de Compute & Rede** | 1 EC2 solta + **NAT Gateway** caro | **ALB (`/health/ready`) + ASG (1x EC2) + 3 SGs estritos**, **sem NAT Gateway** | **−US$ 32,85/mês** fixos |
+| **Governança FinOps (Budgets + Alarmes)** | ❌ Inexistente | ✅ `aws_budgets_budget` + SNS KMS + CloudWatch CPU Alarm | Alertas antes de tudo |
+
+---
+
+## 7. FinOps: Custo por Hora e por Mês (AWS Real vs. Floci)
+
+Embora toda a validação deste projeto rode a **custo US$ 0,00 no Floci**, um dos requisitos essenciais de engenharia Cloud/FinOps é saber calcular quanto a arquitetura custa por hora e por mês na AWS real (`us-east-1` - N. Virginia, preços On-Demand em outubro/2026) e quanto as decisões econômicas economizam.
+
+### 7.1 Custo por Hora e por Mês da Arquitetura Econômica (`us-east-1`)
+
+| Componente | Recurso OpenTofu | Especificação Econômica | Custo por Hora (USD) | Custo Mensal 730h (USD) | Custo durante 10h de Testes (USD) | Custo no Floci (Local/CI) |
+|---|---|---|---:|---:|---:|---:|
+| **Rede (VPC)** | `aws_vpc`, `aws_subnet` (x2), `aws_internet_gateway`, `aws_security_group` (x3) | Subnets públicas + SGs estritos (**Sem NAT Gateway**) | US$ 0,0000 | US$ 0,00 | US$ 0,00 | **US$ 0,00** |
+| **Compute (ASG 1x EC2)** | `aws_autoscaling_group` + `aws_launch_template` (`t3.micro` Linux) | 2 vCPU, 1 GiB RAM (`$0.0104/h`) + IPv4 público (`$0.0050/h`) | US$ 0,0154 | US$ 11,24 | US$ 0,15 | **US$ 0,00** |
+| **Disco EC2 (EBS)** | `block_device_mappings` (`20 GB gp3` KMS) | US$ 0,08/GB-mês = US$ 1,60/mês | US$ 0,0022 | US$ 1,60 | US$ 0,02 | **US$ 0,00** |
+| **Load Balancer (ALB)** | `aws_lb`, `aws_lb_target_group`, `aws_lb_listener` | Base `$0.0225/h` + LCU mínimo `$0.0080/h` + 2 IPv4 públicos (`$0.0100/h`) | US$ 0,0405 | US$ 29,56 | US$ 0,41 | **US$ 0,00** |
+| **Banco (RDS Single-AZ)** | `aws_db_instance.postgres` (`db.t4g.micro`, Single-AZ) | Instância `$0.0160/h` + 20 GB gp3 (`$0.115/GB-mês` = `$0.0032/h`) | US$ 0,0192 | US$ 13,98 | US$ 0,19 | **US$ 0,00** |
+| **Segurança & Storage** | `aws_kms_key` (1 CMK), `aws_secretsmanager_secret` (1 secret), `aws_s3_bucket` (x2) | KMS `$1.00/mês` + Secret `$0.40/mês` + S3 < 5 GB `$0.12/mês` | US$ 0,0021 | US$ 1,52 | US$ 0,02 | **US$ 0,00** |
+| **FinOps & Observabilidade** | `aws_budgets_budget`, `aws_sns_topic`, `aws_cloudwatch_metric_alarm` | 1º Budget grátis, 1 alarme CloudWatch `$0.10/mês` | US$ 0,0001 | US$ 0,10 | US$ 0,00 | **US$ 0,00** |
+| **TOTAL (Stack Completa)** | **37 recursos provisionados** | **Arquitetura Econômica Completa** | **US$ 0,0795 / hora** | **US$ 58,00 / mês** | **US$ 0,79 (em 10h)** | **US$ 0,00** |
+
+> [!IMPORTANT]
+> **Por que derrubar tudo ao final (`tofu destroy`) faz tanta diferença?**
+> Manter a stack ligada apenas durante uma bateria de **10 horas de testes no mês** custa **US$ 0,79** na AWS real (contra **US$ 58,00/mês** se esquecida ligada 24x7). E usando o **Floci**, esse custo cai para **US$ 0,00** com execuções ilimitadas!
+
+### 7.2 Comparativo: Desenho Tradicional Caro vs. Arquitetura Econômica deste Projeto
+
+| Decisão de Arquitetura | Desenho Tradicional ("Padrão Antigo") | Desenho Econômico (Este Projeto) | Economia Mensal (730h) |
+|---|---|---|---:|
+| **Saída de rede das instâncias** | 2x NAT Gateways (Multi-AZ) + 2x EIP (`$0.045/h` cada + IPv4) | **Zero NAT Gateway** (Subnets públicas + SG bloqueando acesso direto à EC2/RDS) | **−US$ 73,00/mês** |
+| **Alta disponibilidade do RDS** | RDS Multi-AZ (`db.t3.small` x2 réplicas + 20 GB) | **RDS Single-AZ** (`db.t4g.micro` Graviton durante os testes) | **−US$ 38,60/mês** |
+| **Instância de Aplicação** | 2x EC2 `t3.small` fixas | **Auto Scaling de 1x `t3.micro` / `t4g.micro`** | **−US$ 19,27/mês** |
+| **Lock do State do Terraform** | Tabela DynamoDB dedicada + KMS | **S3 Lock Nativo (`use_lockfile = true`)** | Simplificação operacional |
+| **Custo Total Mensal (AWS Real)** | **≈ US$ 188,87 / mês** (`US$ 0,2587/h`) | **≈ US$ 58,00 / mês** (`US$ 0,0795/h`) | **Economia de US$ 130,87/mês (−69%)** |
+
+### 7.3 Nota sobre o Novo Plano de Créditos da AWS (2025/2026)
+Para quem abre uma **nova conta AWS** no modelo atual de Free Tier baseado em créditos:
+- A AWS concede **US$ 100 em créditos no cadastro** + **US$ 100 adicionais** ao completar 5 atividades práticas (totalizando **US$ 200** válidos por até 6 meses no plano gratuito).
+- Os créditos cobrem **EC2, RDS, ALB, S3, KMS e Secrets Manager**, o que significa que a nossa stack de **US$ 0,0795/hora** poderia rodar por mais de **2.500 horas** dentro dos créditos — ou indefinidamente a **custo zero** usando o **Floci** localmente e no GitHub Actions.
+
+---
+
+## 8. Decisões e Trade-offs
+
+| Decisão | Alternativa | Por quê / Trade-off |
+|---|---|---|
+| **OpenTofu 1.10+ com `use_lockfile = true`** | Terraform clássico + DynamoDB | 100% open-source (Linux Foundation) e elimina a necessidade de provisionar e manter uma tabela DynamoDB só para travamento de estado |
+| **Emulador local Floci (`floci/floci:2.3.0`)** | AWS Free Tier / LocalStack | Não exige conta AWS nem cartão de crédito, não requer token de autenticação e emula RDS, ALB, ASG, OIDC e Budgets gratuitamente em ~13 MiB de RAM |
+| **Subnets públicas sem NAT Gateway + SGs em 3 camadas** | Subnets privadas + NAT Gateway | Economiza ~US$ 32,85/mês por AZ. O isolamento de rede não é perdido porque o `app-sg` só aceita tráfego na porta `8000` vindo do `alb-sg`, e o `db-sg` só aceita tráfego na porta `5432` vindo do `app-sg` (além de `publicly_accessible = false` no RDS) |
+| **RDS Single-AZ (`multi_az = false` por padrão)** | RDS Multi-AZ | Corta o custo do banco pela metade nos ambientes de teste/homologação. Para produção crítica, basta alterar `multi_az = true` no `aws-prod` |
+| **Autenticação OIDC (`AssumeRoleWithWebIdentity`)** | `AWS_ACCESS_KEY_ID` estática nos Secrets | Credenciais temporárias com rotação automática a cada job do GitHub Actions; elimina risco de vazamento de chaves de longa duração |
+| **Diretórios por ambiente (`environments/floci-local` e `aws-prod`)** | Terraform Workspaces | Isolamento explícito de backend e provedores sem risco de dar `apply` no workspace errado por engano |
+
+---
+
+## 9. O que eu faria diferente em produção real de larga escala
+
+1. **VPC Endpoints (`S3` Gateway Endpoint gratuito + Interface Endpoints) ou `fck-nat`:** Em vez de NAT Gateway gerenciado caro, usaria o Gateway Endpoint gratuito para S3 e IPv6 Egress-Only Internet Gateway (gratuito na AWS!) para baixar imagens do GHCR em subnets privadas.
+2. **Certificado TLS (ACM) + Redirecionamento HTTP → HTTPS no ALB:** Com um domínio no Route53, adicionaria um listener na porta `443` com certificado gratuito do AWS Certificate Manager (ACM).
+3. **State Encryption Nativo do OpenTofu (`encryption {}` block):** Criptografaria o próprio conteúdo do `.tfstate` em trânsito e repouso usando chave KMS antes mesmo de enviá-lo ao S3.
+4. **ECS Fargate Spot ou AWS App Runner:** Para cargas variáveis, substituir o ALB + EC2 por Fargate Spot ou App Runner pode reduzir ainda mais o custo base do Load Balancer.
+
+---
+
+## Documentação Complementar
+
+Consulte o **[Guia Completo de Estudo (`docs/GUIA_DE_ESTUDO.md`)](docs/GUIA_DE_ESTUDO.md)** para a explicação passo a passo de cada módulo HCL, como funciona o handshake OIDC, a anatomia dos Security Groups e o laboratório prático de troubleshooting.

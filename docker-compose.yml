@@ -1,0 +1,26 @@
+# Emulador AWS local open-source (Floci - https://github.com/floci-io/floci)
+# Substitui o LocalStack Community (descontinuado em 03/2026) e o AWS Free Tier:
+# - Sem conta AWS, sem auth token, sem feature gates (licença MIT)
+# - Boot nativo Quarkus/GraalVM em ~24 ms e ~13 MiB de RAM ociosa
+# - Console Web sob demanda em: http://localhost:4566/_floci/ui
+name: floci-aws-emulator
+
+services:
+  floci:
+    image: floci/floci:2.3.0@sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9
+    ports:
+      - "127.0.0.1:${FLOCI_PORT:-4566}:4566"
+    environment:
+      FLOCI_STORAGE_MODE: ${FLOCI_STORAGE_MODE:-memory}
+      FLOCI_SERVICES_EC2_MOCK: ${FLOCI_SERVICES_EC2_MOCK:-true}
+      FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES: ${FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES:-fixed}
+      FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED: ${FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED:-false}
+      FLOCI_SERVICES_RDS_MOCK: ${FLOCI_SERVICES_RDS_MOCK:-true}
+    volumes:
+      - floci_data:/app/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  floci_data:

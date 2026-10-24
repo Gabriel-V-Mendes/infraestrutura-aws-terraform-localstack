@@ -1,0 +1,7 @@
+project_name       = "devops-api"
+environment        = "prod"
+aws_region         = "us-east-1"
+monthly_budget_usd = "15.0"
+ec2_instance_type  = "t4g.micro"
+db_instance_class  = "db.t4g.micro"
+multi_az           = false

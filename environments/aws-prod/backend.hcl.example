@@ -1,0 +1,7 @@
+# Backend S3 na AWS real com lock nativo do OpenTofu 1.10+ (use_lockfile = true)
+# Sem necessidade de DynamoDB. Autenticado via GitHub Actions OIDC.
+bucket       = "devops-api-prod-tofu-state"
+key          = "aws-prod/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
