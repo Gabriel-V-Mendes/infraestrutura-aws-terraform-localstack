@@ -73,7 +73,7 @@ jobs:
   # 3. Segurança IaC (Trivy Config)
   # ============================================================================
   security:
-    name: IaC Security Scan (Trivy & Checkov)
+    name: IaC Security Scan (Trivy Config)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -144,6 +144,8 @@ jobs:
       - name: Comentar Plan e Estimativa FinOps no Pull Request
         if: github.event_name == 'pull_request'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PLAN_SUMMARY: ${{ steps.plan.outputs.summary }}
         with:
           script: |
             const fs = require('fs');
@@ -152,40 +154,42 @@ jobs:
             const truncatedPlan = planText.length > maxLen
               ? planText.slice(-maxLen) + '\n... (truncado)'
               : planText;
-            const summary = `${{ steps.plan.outputs.summary }}`;
+            const summary = process.env.PLAN_SUMMARY || 'Plan gerado com sucesso';
             const marker = '<!-- opentofu-floci-plan-comment -->';
 
-            const body = `${marker}
-            ## 🏗️ OpenTofu Plan & FinOps Report (Emulado via Floci)
-
-            | Validação | Status | Detalhe |
-            |---|---|---|
-            | **Formatação (`tofu fmt`)** | ✅ Passou | Padrão canônico HCL |
-            | **Validação (`tofu validate`)** | ✅ Passou | `floci-local` & `aws-prod` válidos |
-            | **Segurança IaC (`trivy config`)** | ✅ Passou | `0 CRITICAL / 0 HIGH` |
-            | **Chaves Estáticas (`gitleaks`)** | ✅ Zero Chaves | Federação via **OIDC (`sts:AssumeRoleWithWebIdentity`)** |
-            | **Backend State S3** | ✅ Lock Nativo | `use_lockfile = true` (`.tflock` no S3, sem DynamoDB) |
-            | **Resumo do Plano** | ✅ Pronto | \`${summary}\` |
-
-            ### 💰 Estimativa FinOps: Custo na AWS Real (`us-east-1`) vs. Floci
-
-            | Recurso | Especificação Econômica | Custo/Hora (AWS) | Custo/Mês (730h AWS) | No Floci (Local/CI) |
-            |---|---|---:|---:|---:|
-            | **VPC + 2 Subnets Públicas + IGW + 3 SGs** | Sem NAT Gateway (economia de US$ 32,85/mês) | US$ 0,0000 | US$ 0,00 | **US$ 0,00** |
-            | **Auto Scaling (1x EC2 `t3.micro` + IPv4) + EBS 20 GB gp3** | 2 vCPU, 1 GiB RAM, IMDSv2 + KMS | US$ 0,0176 | US$ 12,84 | **US$ 0,00** |
-            | **Application Load Balancer (ALB)** | Apenas durante os testes (base + LCU + IPv4) | US$ 0,0405 | US$ 29,56 | **US$ 0,00** |
-            | **RDS PostgreSQL 17 Single-AZ (`db.t4g.micro`) + 20 GB** | Sem Multi-AZ (economia de 50%) | US$ 0,0192 | US$ 13,98 | **US$ 0,00** |
-            | **S3 + KMS + Secrets Manager + Budgets + CloudWatch** | 1 KMS CMK + 1 Secret + S3 (<5 GB) + 1 Alarm | US$ 0,0022 | US$ 1,62 | **US$ 0,00** |
-            | **Total (Stack Completa Ativa)** | **37 recursos gerenciados** | **US$ 0,0795/h** | **US$ 58,00/mês** | **US$ 0,00** |
-
-            <details>
-            <summary>📋 <strong>Clique para expandir a saída completa do <code>tofu plan</code></strong></summary>
-
-            \`\`\`hcl
-            ${truncatedPlan}
-            \`\`\`
-
-            </details>`;
+            const body = [
+              marker,
+              '## 🏗️ OpenTofu Plan & FinOps Report (Emulado via Floci)',
+              '',
+              '| Validação | Status | Detalhe |',
+              '|---|---|---|',
+              '| **Formatação (`tofu fmt`)** | ✅ Passou | Padrão canônico HCL |',
+              '| **Validação (`tofu validate`)** | ✅ Passou | `floci-local` & `aws-prod` válidos |',
+              '| **Segurança IaC (`trivy config`)** | ✅ Passou | `0 CRITICAL / 0 HIGH` |',
+              '| **Chaves Estáticas (`gitleaks`)** | ✅ Zero Chaves | Federação via **OIDC (`sts:AssumeRoleWithWebIdentity`)** |',
+              '| **Backend State S3** | ✅ Lock Nativo | `use_lockfile = true` (`.tflock` no S3, sem DynamoDB) |',
+              '| **Resumo do Plano** | ✅ Pronto | `' + summary + '` |',
+              '',
+              '### 💰 Estimativa FinOps: Custo na AWS Real (`us-east-1`) vs. Floci',
+              '',
+              '| Recurso | Especificação Econômica | Custo/Hora (AWS) | Custo/Mês (730h AWS) | No Floci (Local/CI) |',
+              '|---|---|---:|---:|---:|',
+              '| **VPC + 2 Subnets Públicas + IGW + 3 SGs** | Sem NAT Gateway (economia de US$ 32,85/mês) | US$ 0,0000 | US$ 0,00 | **US$ 0,00** |',
+              '| **Auto Scaling (1x EC2 `t3.micro` + IPv4) + EBS 20 GB gp3** | 2 vCPU, 1 GiB RAM, IMDSv2 + KMS | US$ 0,0176 | US$ 12,84 | **US$ 0,00** |',
+              '| **Application Load Balancer (ALB)** | Apenas durante os testes (base + LCU + IPv4) | US$ 0,0405 | US$ 29,56 | **US$ 0,00** |',
+              '| **RDS PostgreSQL 17 Single-AZ (`db.t4g.micro`) + 20 GB** | Sem Multi-AZ (economia de 50%) | US$ 0,0192 | US$ 13,98 | **US$ 0,00** |',
+              '| **S3 + KMS + Secrets Manager + Budgets + CloudWatch** | 1 KMS CMK + 1 Secret + S3 (<5 GB) + 1 Alarm | US$ 0,0022 | US$ 1,62 | **US$ 0,00** |',
+              '| **Total (Stack Completa Ativa)** | **37 recursos gerenciados** | **US$ 0,0795/h** | **US$ 58,00/mês** | **US$ 0,00** |',
+              '',
+              '<details>',
+              '<summary>📋 <strong>Clique para expandir a saída completa do <code>tofu plan</code></strong></summary>',
+              '',
+              '```hcl',
+              truncatedPlan,
+              '```',
+              '',
+              '</details>'
+            ].join('\n');
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
