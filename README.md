@@ -232,6 +232,9 @@ Arquivo: [`.github/workflows/infra-ci.yml`](.github/workflows/infra-ci.yml)
 | **E2E Apply, OIDC & Destroy (Floci)** | Após os 3 acima | Sobe o Floci → Bootstrap S3 → `tofu init` → `tofu plan` → **Comenta o Plan + Tabela FinOps no PR** → `tofu apply` (37 recursos) → `smoke-infra.sh` → `verify-oidc.sh` → `tofu destroy` | Qualquer etapa do ciclo de vida ou smoke test falhar |
 | **Deploy AWS Prod (OIDC)** | Push na `main` se `AWS_PROD_ENABLED=true` | Assume a IAM Role na AWS real via OIDC (`id-token: write`) e executa o OpenTofu | Falha de federação OIDC ou plano inválido |
 
+* **Evidência do CI (GitHub Actions):**
+  [Run #40337417754 no GitHub Actions](https://github.com/Gabriel-V-Mendes/infraestrutura-aws-terraform-localstack/actions/runs/40337417754) (todos os jobs `Format & Validate`, `Secret Scan`, `IaC Security Scan` e `E2E Apply, OIDC & Destroy` aprovados na branch `main`).
+
 ### 5.1 Proteção da Branch `main` e Comentário Automático no PR
 
 A branch `main` é protegida via [`scripts/protect-main.sh`](scripts/protect-main.sh) (`make protect-main`), exigindo Pull Request atualizado, histórico linear e os **4 status checks obrigatórios** verdes antes de liberar o merge (inclusive para administradores).
